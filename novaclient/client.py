@@ -64,12 +64,17 @@ class HTTPClient(httplib2.Http):
         _logger.debug("REQ: %s\n" % "".join(string_parts))
         _logger.debug("RESP:%s %s\n", resp, body)
 
-    def request(self, *args, **kwargs):
+    def request(self,  *args, **kwargs):
         kwargs.setdefault('headers', {})
         kwargs['headers']['User-Agent'] = self.USER_AGENT
         if 'body' in kwargs:
             kwargs['headers']['Content-Type'] = 'application/json'
             kwargs['body'] = json.dumps(kwargs['body'])
+        if 'nothrow' in kwargs:
+            nothrow = kwargs['nothrow']
+            kwargs.pop('nothrow')
+        else:
+            nothrow = False
 
         resp, body = super(HTTPClient, self).request(*args, **kwargs)
 
@@ -83,7 +88,7 @@ class HTTPClient(httplib2.Http):
         else:
             body = None
 
-        if resp.status in (400, 401, 403, 404, 408, 413, 500, 501):
+        if not nothrow and resp.status in (400, 401, 403, 404, 408, 413, 500, 501):
             raise exceptions.from_response(resp, body)
 
         return resp, body
@@ -128,45 +133,61 @@ class HTTPClient(httplib2.Http):
     def authenticate(self):
         scheme, netloc, path, query, frag = urlparse.urlsplit(
                                                     self.auth_url)
+
+        auth_url = self.auth_url
+        version = self._get_version_from_url(auth_url)
+        fallbacks = self._auth_versions()
+        base_url = ''
+        while auth_url:
+            if not version:  # in case of redirects we try fallback versions
+                version = fallbacks.next()
+                base_url = auth_url
+                auth_url = urlparse.urljoin(base_url, version+'/')
+            maj_version = version[:2]
+            try:  # get auth functions by version string
+                req_f = getattr(self, '_%s_auth_request' % maj_version)
+                resp_f = getattr(self, '_token_from_%s_response' % maj_version)
+            except AttributeError:
+                raise exceptions.ClientException(501,
+                                     'This protocol version is not supported')
+            resp, body = req_f(auth_url)
+            print body
+            if resp.status in (200, 204):
+                try:
+                    return resp_f(resp, body)
+                except KeyError:
+                    pass
+            elif resp.status == 305:
+                auth_url = resp['location']
+                version = self._get_version_from_url(auth_url)
+                continue
+            if not base_url:  # in normal cases we fail
+                raise exceptions.Unauthorized(resp.status, message=body)
+            else:  # try another fallback
+                auth_url = base_url
+                version = ''
+
+    def _auth_versions(self):
+        for v in ('v1.0', 'v2.0'):
+            yield v
+
+    def _get_version_from_url(self, url):
+        path = urlparse.urlsplit(url)[2]
         path_parts = path.split('/')
         for part in path_parts:
             if len(part) > 0 and part[0] == 'v':
-                self.version = part
-                break
+                return part
+        return ''
 
-        auth_url = self.auth_url
-        if self.version == "v2.0":  # FIXME(chris): This should be better.
-            while auth_url:
-                auth_url = self._v2_auth(auth_url)
-        else:
-            try:
-                while auth_url:
-                    auth_url = self._v1_auth(auth_url)
-            # In some configurations nova makes redirection to
-            # v2.0 keystone endpoint. Also, new location does not contain
-            # real endpoint, only hostname and port.
-            except exceptions.ClientException:
-                if auth_url.find('v2.0') < 0:
-                    auth_url = urlparse.urljoin(auth_url, 'v2.0/')
-                self._v2_auth(auth_url)
-
-    def _v1_auth(self, url):
+    def _v1_auth_request(self, url):
         headers = {'X-Auth-User': self.user,
                    'X-Auth-Key': self.apikey}
         if self.projectid:
             headers['X-Auth-Project-Id'] = self.projectid
 
-        resp, body = self.request(url, 'GET', headers=headers)
-        if resp.status in (200, 204):  # in some cases we get No Content
-            self.management_url = resp['x-server-management-url']
+        return self.request(url, 'GET', headers=headers, nothrow=True)
 
-            self.auth_token = resp['x-auth-token']
-        elif resp.status == 305:
-            return resp['location']
-        else:
-            raise exceptions.from_response(resp, body)
-
-    def _v2_auth(self, url):
+    def _v2_auth_request(self, url):
         body = {"passwordCredentials": {"username": self.user,
                                         "password": self.apikey}}
 
@@ -174,19 +195,20 @@ class HTTPClient(httplib2.Http):
             body['passwordCredentials']['tenantId'] = self.projectid
 
         token_url = urlparse.urljoin(url, "tokens")
-        resp, body = self.request(token_url, "POST", body=body)
+        return self.request(token_url, "POST", body=body, nothrow=True)
 
-        if resp == 200:  # content must always present
-            self.management_url = body["auth"]["serviceCatalog"] \
-                                      ["nova"][0]["publicURL"]
-            self.auth_token = body["auth"]["token"]["id"]
+    def _token_from_v1_response(self, resp, body):
+        self.management_url = resp['x-server-management-url']
+        self.auth_token = resp['x-auth-token']
 
-            #TODO(chris): Implement service_catalog
-            self.service_catalog = None
-        elif resp.status == 305:
-            return resp['location']
-        else:
-            raise exceptions.from_response(resp, body)
+    def _token_from_v2_response(self, resp, body):
+        self.management_url = body["auth"]["serviceCatalog"] \
+                                  ["nova"][0]["publicURL"]
+        self.auth_token = body["auth"]["token"]["id"]
+
+        #TODO(chris): Implement service_catalog
+        self.service_catalog = None
+
 
     def _munge_get_url(self, url):
         """
