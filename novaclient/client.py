@@ -151,7 +151,6 @@ class HTTPClient(httplib2.Http):
                 raise exceptions.ClientException(501,
                                      'This protocol version is not supported')
             resp, body = req_f(auth_url)
-            print body
             if resp.status in (200, 204):
                 try:
                     return resp_f(resp, body)
